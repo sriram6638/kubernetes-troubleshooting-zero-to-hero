@@ -6,7 +6,7 @@ on:
       - main
   pull_request:
 
-# ✅ Prevent parallel runs (fixes state lock issue)
+# ✅ Prevent parallel runs
 concurrency:
   group: terraform-production
   cancel-in-progress: false
@@ -30,36 +30,68 @@ jobs:
 
     - name: Set up Terraform
       uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.14.8
 
-    - name: Azure Login (OIDC)
+    # ✅ Azure Login (OIDC)
+    - name: Azure Login
       uses: azure/login@v2
       with:
         client-id: ${{ secrets.AZURE_CLIENT_ID }}
         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-    # ✅ Init
+    # ✅ Fix subscription context issue
+    - name: Set Azure Subscription
+      run: az account set --subscription ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    # ✅ Terraform Init
     - name: Terraform Init
       run: terraform init -backend-config=backend.tfvars
+
+    # 🔥 ONE-TIME FIX (REMOVE AFTER SUCCESS)
+    - name: Force Unlock (one-time cleanup)
+      run: |
+        echo "Clearing stuck Terraform lock..."
+        terraform force-unlock -force 8b568d6e-9143-1b46-39d4-16f7870d6ebe || true
 
     # ✅ Validate
     - name: Terraform Validate
       run: terraform validate
 
-    # ✅ Optional: Format check (good practice)
+    # ✅ Format Check
     - name: Terraform Format Check
       run: terraform fmt -check
 
-    # ✅ Retry logic for transient lock issues
-    - name: Terraform Plan (with retry)
+    # ✅ Plan with dynamic unlock + retry
+    - name: Terraform Plan
       run: |
         for i in 1 2 3; do
-          terraform plan -out=tfplan && break
-          echo "Retrying due to lock..."
-          sleep 15
+          echo "Attempt $i: Running terraform plan..."
+
+          terraform plan -out=tfplan 2>error.log && exit 0
+
+          if grep -q "state blob is already locked" error.log; then
+            echo "Lock detected..."
+
+            LOCK_ID=$(grep -oP 'ID:\s+\K[a-z0-9-]+' error.log | head -1)
+
+            echo "Lock ID: $LOCK_ID"
+
+            if [ ! -z "$LOCK_ID" ]; then
+              echo "Force unlocking..."
+              terraform force-unlock -force $LOCK_ID
+            fi
+          fi
+
+          echo "Retrying in 20 seconds..."
+          sleep 20
         done
 
-    # ✅ Apply only on main push
+        echo "Terraform plan failed after retries"
+        exit 1
+
+    # ✅ Apply only if plan succeeded
     - name: Terraform Apply
-      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      if: success() && github.ref == 'refs/heads/main' && github.event_name == 'push'
       run: terraform apply -auto-approve tfplan
